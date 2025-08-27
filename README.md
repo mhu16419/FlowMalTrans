@@ -14,7 +14,7 @@ Applying deep learning to malware detection has drawn great attention due to its
 
 ## Citation
 
-If you use this code or the dataset in your research, please cite our paper:
+If you find our work inspiring, please cite our paper:
 
 ```bibtex
 @inproceedings{
