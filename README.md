@@ -12,3 +12,19 @@ Applying deep learning to malware detection has drawn great attention due to its
 <p align="center">
   <em>Figure 1: FlowMalTrans architecture for cross-ISA binary translation</em>
 </p>
+
+## Citation
+
+If you use this code or the dataset in your research, please cite our paper:
+
+```bibtex
+@inproceedings{
+hu2025unsupervised,
+title={Unsupervised Binary Code Translation for Malware Detection Using Flow-Adapter Architecture},
+author={Minghao Hu and Junzhe Wang and Weisen Zhao and Qiang Zeng and Lannan Luo},
+booktitle={The 2025 Conference on Empirical Methods in Natural Language Processing},
+year={2025},
+url={https://openreview.net/forum?id=hfl5oqbfj1}
+}
+```
+
