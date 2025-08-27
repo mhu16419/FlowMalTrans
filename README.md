@@ -9,7 +9,6 @@ Applying deep learning to malware detection has drawn great attention due to its
 <p align="center">
   <img src="overview.png" alt="FlowMalTrans Architecture" width="800"/>
 </p>
-
 <!-- Add caption -->
 <p align="center">
   <em>Figure 1: FlowMalTrans architecture for cross-ISA binary translation</em>
