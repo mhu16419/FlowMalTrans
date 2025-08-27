@@ -1,5 +1,4 @@
-# FlowMalTrans [EMNLP 25]
-FlowMalTrans: Unsupervised Binary Code Translation for Malware Detection
+# FlowMalTrans: Unsupervised Binary Code Translation for Malware Detection Using Flow-Adapter Architecture.[EMNLP 25]
 
 # Overview
 
