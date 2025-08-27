@@ -5,7 +5,7 @@ FlowMalTrans: Unsupervised Binary Code Translation for Malware Detection
 
 <!-- Center the image -->
 <p align="center">
-  <img src="Overview.pdf" alt="FlowMalTrans Architecture" width="800"/>
+  <img src="overview.png" alt="FlowMalTrans Architecture" width="800"/>
 </p>
 
 <!-- Add caption -->
