@@ -7,7 +7,7 @@ Applying deep learning to malware detection has drawn great attention due to its
 
 <!-- Center the image -->
 <p align="center">
-  <img src="overview.png" alt="FlowMalTrans Architecture" width="800"/>
+  <img src="overview.png" alt="FlowMalTrans Architecture" width="1000"/>
 </p>
 <!-- Add caption -->
 <p align="center">
