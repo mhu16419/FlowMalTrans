@@ -1,5 +1,6 @@
 # FlowMalTrans: Unsupervised Binary Code Translation for Malware Detection Using Flow-Adapter Architecture. [EMNLP 25 Findings]
 
+[Paper Link](https://arxiv.org/pdf/2508.20212v1)
 This repo is regularly updated and we will release the source code soon. 
 
 # Overview
