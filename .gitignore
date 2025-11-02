@@ -1,5 +1,7 @@
 # Output directory
 output/
+Malware_detection_code/
+Malware_detection_files/
 
 # Python
 __pycache__/
