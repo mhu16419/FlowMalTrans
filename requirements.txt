@@ -1,0 +1,8 @@
+# Core (training / translation / evaluation) -- tested with Python 3.10 and torch 2.3.1 + CUDA 12.1
+torch>=2.0
+numpy>=1.21,<2
+sacrebleu>=2.0
+# Malware detection and analysis notebooks
+scikit-learn
+matplotlib
+jupyter

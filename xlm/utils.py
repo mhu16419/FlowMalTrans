@@ -10,11 +10,10 @@ import re
 import sys
 import pickle
 import random
-import getpass
 import argparse
-import subprocess
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from .logger import create_logger
 
@@ -22,7 +21,7 @@ from .logger import create_logger
 FALSY_STRINGS = {'off', 'false', '0'}
 TRUTHY_STRINGS = {'on', 'true', '1'}
 
-DUMP_PATH = '/checkpoint/%s/dumped' % getpass.getuser()
+DUMP_PATH = './dumped'  # used when --dump_path is empty
 DYNAMIC_COEFF = ['lambda_clm', 'lambda_mlm', 'lambda_pc', 'lambda_ae', 'lambda_mt', 'lambda_bt']
 
 
@@ -52,7 +51,8 @@ def initialize_exp(params):
     """
     # dump parameters
     get_dump_path(params)
-    pickle.dump(params, open(os.path.join(params.dump_path, 'params.pkl'), 'wb'))
+    with open(os.path.join(params.dump_path, 'params.pkl'), 'wb') as f:
+        pickle.dump(params, f)
 
     # get running command
     command = ["python", sys.argv[0]]
@@ -92,17 +92,12 @@ def get_dump_path(params):
 
     # create the sweep path if it does not exist
     sweep_path = os.path.join(dump_path, params.exp_name)
-    if not os.path.exists(sweep_path):
-        subprocess.Popen("mkdir -p %s" % sweep_path, shell=True).wait()
+    os.makedirs(sweep_path, exist_ok=True)
 
     # create an ID for the job if it is not given in the parameters.
-    # if we run on the cluster, the job ID is the one of Chronos.
-    # otherwise, it is randomly generated
+    # inside a SLURM job it is the SLURM job ID, otherwise it is randomly generated
     if params.exp_id == '':
-        chronos_job_id = os.environ.get('CHRONOS_JOB_ID')
-        slurm_job_id = os.environ.get('SLURM_JOB_ID')
-        assert chronos_job_id is None or slurm_job_id is None
-        exp_id = chronos_job_id if chronos_job_id is not None else slurm_job_id
+        exp_id = os.environ.get('SLURM_JOB_ID')
         if exp_id is None:
             chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
             while True:
@@ -115,8 +110,7 @@ def get_dump_path(params):
 
     # create the dump folder / update parameters
     params.dump_path = os.path.join(sweep_path, params.exp_id)
-    if not os.path.isdir(params.dump_path):
-        subprocess.Popen("mkdir -p %s" % params.dump_path, shell=True).wait()
+    os.makedirs(params.dump_path, exist_ok=True)
 
 
 def to_cuda(*args):
@@ -131,8 +125,10 @@ def restore_segmentation(path):
     Take a file segmented with BPE and restore it to its original segmentation.
     """
     assert os.path.isfile(path)
-    restore_cmd = "sed -i -r 's/(@@ )|(@@ ?$)//g' %s"
-    subprocess.Popen(restore_cmd % path, shell=True).wait()
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.read().split('\n')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(re.sub(r'(@@ )|(@@ ?$)', '', line) for line in lines))
 
 
 def parse_lambda_config(params):
@@ -280,6 +276,26 @@ def shuf_order(langs, params=None, n=5):
 
     assert len(s_mono) + len(s_para) > 0
     return [(lang, None) for lang in s_mono] + s_para
+
+
+def get_latent_code(enc, params, h2z_projection=None):
+    """
+    Sentence-level latent code z from encoder states.
+    enc: (batch_size, seq_len, emb_dim). The enabled representations (mean pooling, max pooling,
+    first-token / CLS embedding, always in this order) are concatenated (params.concat_h) or summed,
+    then optionally projected to z_size with `h2z_projection` (params.use_h2z_matrix).
+    """
+    if not (params.use_mean_pooling or params.use_max_pooling or params.use_CSL):
+        raise ValueError('There must at least be one method to obtain the sentence level latent code')
+    hs = []
+    if params.use_mean_pooling:
+        hs.append(F.avg_pool1d(enc.transpose(1, 2).contiguous(), enc.size(1)).squeeze(2))  # [B, emb_dim]
+    if params.use_max_pooling:
+        hs.append(F.max_pool1d(enc.transpose(1, 2).contiguous(), enc.size(1)).squeeze(2))
+    if params.use_CSL:
+        hs.append(enc[:, 0])
+    h_enc = torch.cat(hs, dim=-1) if params.concat_h else sum(hs)
+    return h2z_projection(h_enc) if h2z_projection is not None else h_enc
 
 
 def find_modules(module, module_name, module_instance, found):

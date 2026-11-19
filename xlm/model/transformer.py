@@ -18,44 +18,6 @@ from .memory import HashingMemory
 
 N_MAX_POSITIONS = 512  # maximum input sequence length
 
-DECODER_ONLY_PARAMS = [
-    'layer_norm15.%i.weight', 'layer_norm15.%i.bias',
-    'encoder_attn.%i.q_lin.weight', 'encoder_attn.%i.q_lin.bias',
-    'encoder_attn.%i.k_lin.weight', 'encoder_attn.%i.k_lin.bias',
-    'encoder_attn.%i.v_lin.weight', 'encoder_attn.%i.v_lin.bias',
-    'encoder_attn.%i.out_lin.weight', 'encoder_attn.%i.out_lin.bias'
-]
-
-LATENT_ONLY_PARAMS1 = [
-    'pred_layer.z_proj.weight',
-    'pred_layer.z_proj.bias'
-]
-
-LATENT_ONLY_PARAMS2 = [
-    'pred_layer.z_proj.weight',
-    'pred_layer.z_proj.bias',
-    'pred_layer.weight_network.weight',
-    'pred_layer.weight_network.bias'
-]
-
-LATENT_ONLY_PARAMS3 = [
-    'pred_layer.weight_network.weight',
-    'pred_layer.weight_network.bias'
-]
-
-
-TRANSFORMER_LAYER_PARAMS = [
-    'attentions.%i.q_lin.weight', 'attentions.%i.q_lin.bias',
-    'attentions.%i.k_lin.weight', 'attentions.%i.k_lin.bias',
-    'attentions.%i.v_lin.weight', 'attentions.%i.v_lin.bias',
-    'attentions.%i.out_lin.weight', 'attentions.%i.out_lin.bias',
-    'layer_norm1.%i.weight', 'layer_norm1.%i.bias',
-    'ffns.%i.lin1.weight', 'ffns.%i.lin1.bias',
-    'ffns.%i.lin2.weight', 'ffns.%i.lin2.bias',
-    'layer_norm2.%i.weight', 'layer_norm2.%i.bias'
-]
-
-
 logger = getLogger()
 
 
@@ -80,8 +42,9 @@ def create_sinusoidal_embeddings(n_pos, dim, out):
         [pos / np.power(10000, 2 * (j // 2) / dim) for j in range(dim)]
         for pos in range(n_pos)
     ])
-    out[:, 0::2] = torch.FloatTensor(np.sin(position_enc[:, 0::2]))
-    out[:, 1::2] = torch.FloatTensor(np.cos(position_enc[:, 1::2]))
+    with torch.no_grad():
+        out[:, 0::2] = torch.FloatTensor(np.sin(position_enc[:, 0::2]))
+        out[:, 1::2] = torch.FloatTensor(np.cos(position_enc[:, 1::2]))
     out.detach_()
     out.requires_grad = False
 
@@ -130,19 +93,23 @@ class PredLayer(nn.Module):
         self.pad_index = params.pad_index
         dim = params.emb_dim
         self.z_proj = None
-        self.params = params
+
+        # sentence-level latent code z (flow adapter); all options default to "off"
+        self.use_latent_code = getattr(params, 'use_latent_code', False)
+        self.latent_concat = getattr(params, 'latent_concat', True)
+        self.use_weight_network = getattr(params, 'use_weight_network', False)
 
         # considering if the sentence-levl latent code is used
-        if params.use_latent_code:
+        if self.use_latent_code:
             assert params.z_size > 0
-            if params.latent_concat:
+            if self.latent_concat:
                 self.z_proj = Linear(dim+params.z_size, dim, bias=True)
             else:
                 if params.z_size != dim:
                     self.z_proj = Linear(params.z_size, dim, bias=True)
                 else:
                     self.z_proj = None
-                if params.use_weight_network:
+                if self.use_weight_network:
                     self.weight_network = Linear(dim+params.z_size, dim, bias=True)
 
         if params.asm is False:
@@ -157,27 +124,32 @@ class PredLayer(nn.Module):
             )
 
 
+    def add_latent_code(self, x, z):
+        """
+        Inject the sentence-level latent code z (one vector per target token,
+        same size as the batch of hidden states x) into the decoder output x.
+            latent_concat:      x = z_proj([x; z])
+            else, with weight network:  g = sigmoid(W [x; z]);  x = (1 - g) * x + g * z_proj(z)
+            else:               x = x + z_proj(z)
+        (z_proj is skipped when z_size == emb_dim and latent_concat is False.)
+        """
+        if not self.use_latent_code or z is None:
+            return x
+        if self.latent_concat:
+            return self.z_proj(torch.cat([x, z], dim=-1))
+        z_hidden = z if self.z_proj is None else self.z_proj(z)
+        if self.use_weight_network:
+            weight = torch.sigmoid(self.weight_network(torch.cat([x, z], dim=-1)))
+            return (1 - weight) * x + weight * z_hidden
+        return x + z_hidden
+
     def forward(self, x, y, get_scores=False, z=None):
         """
         Compute the loss, and optionally the scores.
         """
         assert (y == self.pad_index).sum().item() == 0
 
-        if self.params.use_latent_code and z is not None:
-            if self.params.latent_concat:
-                x = self.z_proj(torch.cat([x, z], dim=-1))  # x: [(tgt_seq_len-1)*batch_size, emb_dim]
-            else:
-                if self.params.use_weight_network:
-                    weight = F.sigmoid(self.weight_network(torch.cat([x, z], dim=-1)))
-                    if self.z_proj is not None:
-                        x = (1 - weight) * x + weight * self.z_proj(z)
-                    else:
-                        x = (1 - weight) * x + weight * z
-                else:
-                    if self.z_proj is not None:
-                        x = x + self.z_proj(z)
-                    else:
-                        x = x + z
+        x = self.add_latent_code(x, z)  # x: [(tgt_seq_len-1)*batch_size, emb_dim]
 
         if self.asm is False:
             scores = self.proj(x).view(-1, self.n_words)
@@ -194,21 +166,7 @@ class PredLayer(nn.Module):
         """
         assert x.dim() == 2
 
-        if self.params.use_latent_code and z is not None:
-            if self.params.latent_concat:
-                x = self.z_proj(torch.cat([x, z], dim=-1))  # x: [batch_size, emb_dim]
-            else:
-                if self.params.use_weight_network:
-                    weight = F.sigmoid(self.weight_network(torch.cat([x, z], dim=-1)))
-                    if self.z_proj is not None:
-                        x = (1 - weight) * x + weight * self.z_proj(z)
-                    else:
-                        x = (1 - weight) * x + weight * z
-                else:
-                    if self.z_proj is not None:
-                        x = x + self.z_proj(z)
-                    else:
-                        x = x + z
+        x = self.add_latent_code(x, z)  # x: [batch_size, emb_dim]
 
         return self.proj.log_prob(x) if self.asm else self.proj(x)
 
@@ -339,6 +297,7 @@ class TransformerModel(nn.Module):
         self.id2lang = params.id2lang
         self.lang2id = params.lang2id
         self.use_lang_emb = getattr(params, 'use_lang_emb', True)
+        self.use_decoder_lang_emb = getattr(params, 'use_decoder_lang_emb', True)  # False: decoders ignore language embeddings (separate decoders)
         assert len(self.dico) == self.n_words
         assert len(self.id2lang) == len(self.lang2id) == self.n_langs
 
@@ -370,7 +329,7 @@ class TransformerModel(nn.Module):
             self.encoder_attn = nn.ModuleList()
 
         # the MASS use different attention for different langauges
-        self.attention_setting = params.attention_setting
+        self.attention_setting = getattr(params, 'attention_setting', 'none')
 
         # memories
         self.memories = nn.ModuleDict()
@@ -428,8 +387,12 @@ class TransformerModel(nn.Module):
         # lengths = (x != self.pad_index).float().sum(dim=1)
         # mask = x != self.pad_index
 
+        # the language id selects the cross-attention output projection of attention_setting 'v1' (MASS); it must be
+        # taken before the language embeddings are switched off for the decoders (--use_decoder_lang_emb false)
+        lang_id = langs.max() if langs is not None else None
+
         # do not use the langauge embedding when seperate decoders
-        if self.is_decoder and not self.params.use_decoder_lang_emb:
+        if self.is_decoder and not self.use_decoder_lang_emb:
             langs = None
 
         # check inputs
@@ -479,9 +442,6 @@ class TransformerModel(nn.Module):
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
-        # for MASS to detect the langauge
-        lang_id = langs.max() if langs is not None else None 
-
         # transformer layers
         for i in range(self.n_layers):
 
@@ -529,14 +489,12 @@ class TransformerModel(nn.Module):
     def predict(self, tensor, pred_mask, y, get_scores, z=None):
         """
         Given the last hidden state, compute word scores and/or the loss.
-            `pred_mask` is a ByteTensor of shape (slen, bs), filled with 1 when
+            `pred_mask` is a BoolTensor of shape (slen, bs), filled with True when
                 we need to predict a word
             `y` is a LongTensor of shape (pred_mask.sum(),)
             `get_scores` is a boolean specifying whether we need to return scores
             'z' (bs, z_size) or None, sentence_level latent
         """
-        # print(tensor.size())  # [seq_length, batch_size, emb_dim]
-        # print(z.size())  # [batch_size, z_size]
         if z is not None:
             z_size = z.shape[-1]
             z = z[None, :, ].repeat(tensor.size(0), 1, 1)  # z: [tgt_seq_len, batch_size, z_size]
@@ -661,7 +619,7 @@ class TransformerModel(nn.Module):
 
         # expand z to corresponding beam size
         if z is not None:
-            z = z[None, :, :].repeat(beam_size, 1, 1).view(-1, z.shape[-1])
+            z = z.unsqueeze(1).expand(bs, beam_size, z.shape[-1]).contiguous().view(-1, z.shape[-1])  # sentence-major, like src_enc
 
         # expand to beam size the source latent representations / source lengths
         src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
@@ -784,15 +742,6 @@ class TransformerModel(nn.Module):
             # stop when we are done with each sentence
             if all(done):
                 break
-
-        # visualize hypotheses
-        # print([len(x) for x in generated_hyps], cur_len)
-        # globals().update( locals() );
-        # !import code; code.interact(local=vars())
-        # for ii in range(bs):
-        #     for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
-        #         print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
-        #     print("")
 
         # select the best hypotheses
         tgt_len = src_len.new(bs)

@@ -34,10 +34,16 @@ def term_handler(signum, frame):
     logger.warning("Bypassing SIGTERM.")
 
 
-def init_signal_handler():
+def init_signal_handler(params=None):
     """
     Handle signals sent by SLURM for time limit / pre-emption.
+    Nothing is installed outside of a SLURM job, nor with --debug_slurm true (which means "ignore SLURM"), so that
+    SIGTERM / SIGUSR1 keep their default behaviour. Call it after init_distributed_mode(params).
     """
+    if 'SLURM_JOB_ID' not in os.environ:
+        return
+    if params is not None and not getattr(params, 'is_slurm_job', True):
+        return
     signal.signal(signal.SIGUSR1, sig_handler)
     signal.signal(signal.SIGTERM, term_handler)
     logger.warning("Signal handler installed.")
@@ -55,6 +61,10 @@ def init_distributed_mode(params):
     """
     params.is_slurm_job = 'SLURM_JOB_ID' in os.environ and not params.debug_slurm
     print("SLURM job: %s" % str(params.is_slurm_job))
+
+    # torchrun / torch.distributed.run pass the local rank through the environment instead of --local_rank
+    if not params.is_slurm_job and params.local_rank == -1 and 'LOCAL_RANK' in os.environ:
+        params.local_rank = int(os.environ['LOCAL_RANK'])
 
     # SLURM job
     if params.is_slurm_job:
@@ -89,8 +99,7 @@ def init_distributed_mode(params):
         params.n_gpu_per_node = params.world_size // params.n_nodes
 
         # define master address and master port
-        print(subprocess.call('echo $HOME', shell=True))
-        hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']], shell=True)
+        hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']])
         params.master_addr = hostnames.split()[0].decode('utf-8')
         assert 10001 <= params.master_port <= 20000 or params.world_size == 1
         print(PREFIX + "Master address: %s" % params.master_addr)
@@ -110,7 +119,8 @@ def init_distributed_mode(params):
         # read environment variables
         params.global_rank = int(os.environ['RANK'])
         params.world_size = int(os.environ['WORLD_SIZE'])
-        params.n_gpu_per_node = int(os.environ['NGPU'])
+        # NGPU is exported by the XLM launch recipe, LOCAL_WORLD_SIZE is set by torchrun
+        params.n_gpu_per_node = int(os.environ['NGPU'] if 'NGPU' in os.environ else os.environ['LOCAL_WORLD_SIZE'])
 
         # number of nodes / node ID
         params.n_nodes = params.world_size // params.n_gpu_per_node

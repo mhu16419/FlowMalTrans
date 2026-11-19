@@ -446,36 +446,6 @@ class HashingMemoryFlat(HashingMemory):
         else:
             self.register_buffer('keys', keys)
 
-    # def _get_indices(self, query, knn, keys):
-    #     """
-    #     Generate scores and indices given keys and unnormalized queries.
-    #     """
-    #     QUERY_SIZE = 4096
-    #     assert query.dim() == 2 and query.size(1) == self.k_dim
-
-    #     # optionally normalize queries
-    #     if self.normalize_query:
-    #         query = query / query.norm(2, 1, keepdim=True).expand_as(query)  # (bs, kdim)
-
-    #     # compute memory indices, and split the query if it is too large
-    #     with torch.no_grad():
-    #         if len(query) <= QUERY_SIZE:
-    #             indices = get_knn_faiss(keys.float(), query.float(), knn, distance='dot_product')[1]
-    #         else:
-    #             indices = torch.cat([
-    #                 get_knn_faiss(keys.float(), query[i:i + QUERY_SIZE].float(), knn, distance='dot_product')[1]
-    #                 for i in range(0, len(query), QUERY_SIZE)
-    #             ], 0)
-    #             # indices0 = get_knn_faiss(keys.float(), query.float(), knn, distance='dot_product')[1]
-    #             # assert (indices0 - indices).abs().sum().item() == 0
-    #         assert len(indices) == len(query)
-
-    #     # compute value scores
-    #     scores = (keys[indices] * query.unsqueeze(1)).sum(2)
-
-    #     # return scores with indices
-    #     assert scores.shape == indices.shape == (query.shape[0], knn)
-    #     return scores, indices
 
     def _get_indices(self, query, knn, keys):
         """

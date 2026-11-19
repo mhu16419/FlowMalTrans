@@ -9,13 +9,20 @@ from logging import getLogger
 import os
 import torch
 
+from .flows import FLOW_TYPES
 from .pretrain import load_embeddings
-#from .transformer import DECODER_ONLY_PARAMS, LATENT_ONLY_PARAMS1, LATENT_ONLY_PARAMS2, TransformerModel  # , TRANSFORMER_LAYER_PARAMS
 from .transformer import TransformerModel
 from .memory import HashingMemory
 
 
 logger = getLogger()
+
+# Parameters of the output layer that only exist when the sentence-level latent
+# code z (flow adapter) is used. They are absent from checkpoints of plain
+# (vanilla XLM / MLM) models and are therefore kept at their random
+# initialisation when such a checkpoint is reloaded.
+LATENT_PARAM_PREFIXES = ('pred_layer.z_proj.', 'pred_layer.weight_network.')
+
 
 
 def check_model_params(params):
@@ -58,6 +65,13 @@ def check_model_params(params):
         params.asm_cutoffs = [int(x) for x in s]
         assert params.max_vocab == -1 or params.asm_cutoffs[-1] < params.max_vocab
 
+    # sentence-level latent code / normalizing flows (flow adapter)
+    if getattr(params, 'use_latent_code', False):
+        assert params.z_size > 0
+        params.flow_type = params.flow_type.lower()
+        assert params.flow_type in FLOW_TYPES, \
+            "flow_type must be one of %s, got '%s'" % (', '.join(FLOW_TYPES), params.flow_type)
+
     # memory
     if params.use_memory:
         HashingMemory.check_params(params)
@@ -98,15 +112,92 @@ def set_pretrain_emb(model, dico, word2id, embeddings):
             if idx is None:
                 continue
             n_found += 1
-            model.embeddings.weight[i] = embeddings[idx].cuda()
-            model.pred_layer.proj.weight[i] = embeddings[idx].cuda()
+            model.embeddings.weight[i] = embeddings[idx]
+            model.pred_layer.proj.weight[i] = embeddings[idx]
     logger.info("Pretrained %i/%i words (%.3f%%)."
                 % (n_found, len(dico), 100. * n_found / len(dico)))
 
 
+def to_device(model):
+    """
+    Move a model to the GPU if one is available (building / reloading models
+    itself also works on a CPU-only machine).
+    """
+    return model.cuda() if torch.cuda.is_available() else model
+
+
+def reload_state_dict(path, keys):
+    """
+    Read a checkpoint on CPU and return the state dict stored under the first
+    key of `keys` that is present ('model' for a single-model checkpoint,
+    'encoder' / 'decoder' for an encoder-decoder checkpoint).
+    """
+    # weights_only=False: checkpoints also store the training parameters (numpy values), which the
+    # default weights_only=True of torch >= 2.6 refuses to unpickle. Only load checkpoints you trust.
+    reloaded = torch.load(path, map_location='cpu', weights_only=False)
+    for key in keys:
+        if key in reloaded:
+            state_dict = reloaded[key]
+            break
+    else:
+        raise KeyError("None of the keys %s found in %s (found: %s)" % (list(keys), path, list(reloaded.keys())))
+    if all([k.startswith('module.') for k in state_dict.keys()]):
+        state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def keep_missing_latent_params(model, state_dict):
+    """
+    Add to `state_dict` the latent-code related parameters of `model`
+    (pred_layer.z_proj.*, pred_layer.weight_network.*) that the reloaded
+    checkpoint does not contain, so that they keep their random initialisation.
+    """
+    for name, value in model.state_dict().items():
+        if name.startswith(LATENT_PARAM_PREFIXES) and name not in state_dict:
+            logger.warning("Parameter %s not found in the reloaded model, keeping its initial value." % name)
+            state_dict[name] = value
+
+
+def reload_encoder(encoder, path):
+    logger.info("Reloading encoder from %s ..." % path)
+    state_dict = reload_state_dict(path, ('model', 'encoder'))
+    keep_missing_latent_params(encoder, state_dict)
+    encoder.load_state_dict(state_dict)
+
+
+def reload_decoder(decoder, path, name='decoder'):
+    logger.info("Reloading %s from %s ..." % (name, path))
+    state_dict = reload_state_dict(path, ('model', 'decoder'))
+    keep_missing_latent_params(decoder, state_dict)
+    # strict=False: a decoder has extra parameters (encoder attention, layer_norm15)
+    # that an MLM-pretrained model does not provide
+    result = decoder.load_state_dict(state_dict, strict=False)
+    if len(result.missing_keys) > 0:
+        logger.info("%s: %i parameters not found in the reloaded model (kept at initial value)." % (name, len(result.missing_keys)))
+    if len(result.unexpected_keys) > 0:
+        logger.warning("%s: ignoring %i unexpected parameters in the reloaded model." % (name, len(result.unexpected_keys)))
+
+
+def freeze_encoder(encoder):
+    """
+    Freeze all the parameters of the encoder, except those whose name ends in 'embeddings.weight': the word,
+    position and language embeddings stay trainable (behaviour inherited from XLM / the earlier runs).
+    """
+    for p in encoder.parameters():
+        p.requires_grad = False
+    for name, p in encoder.named_parameters():
+        if name.endswith('embeddings.weight'):
+            p.requires_grad = True
+
+
+def n_trainable_params(model):
+    return sum([p.numel() for p in model.parameters() if p.requires_grad])
+
+
 def build_model(params, dico):
     """
-    Build model.
+    Build model: a single encoder-only model (MLM / CLM pretraining), or an
+    (encoder, decoder) pair with one decoder shared by all languages.
     """
     if params.encoder_only:
         # build
@@ -120,249 +211,60 @@ def build_model(params, dico):
         # reload a pretrained model
         if params.reload_model != '':
             logger.info("Reloading model from %s ..." % params.reload_model)
-            reloaded = torch.load(params.reload_model, map_location=lambda storage, loc: storage.cuda(params.local_rank))['model']
-            if all([k.startswith('module.') for k in reloaded.keys()]):
-                reloaded = {k[len('module.'):]: v for k, v in reloaded.items()}
-
-            # # HACK to reload models with less layers
-            # for i in range(12, 24):
-            #     for k in TRANSFORMER_LAYER_PARAMS:
-            #         k = k % i
-            #         if k in model.state_dict() and k not in reloaded:
-            #             logger.warning("Parameter %s not found. Ignoring ..." % k)
-            #             reloaded[k] = model.state_dict()[k]
-
-            model.load_state_dict(reloaded)
+            model.load_state_dict(reload_state_dict(params.reload_model, ('model',)))
 
         logger.info("Model: {}".format(model))
-        logger.info("Number of parameters (model): %i" % sum([p.numel() for p in model.parameters() if p.requires_grad]))
+        logger.info("Number of parameters (model): %i" % n_trainable_params(model))
 
-        return model.cuda()
+        return to_device(model)
 
-    else:
-        # build
-        encoder = TransformerModel(params, dico, is_encoder=True, with_output=True)  # TODO: only output when necessary - len(params.clm_steps + params.mlm_steps) > 0
-        decoder = TransformerModel(params, dico, is_encoder=False, with_output=True)
-
-        # reload pretrained word embeddings
-        if params.reload_emb != '':
-            word2id, embeddings = load_embeddings(params.reload_emb, params)
-            set_pretrain_emb(encoder, dico, word2id, embeddings)
-            set_pretrain_emb(decoder, dico, word2id, embeddings)
-
-        # reload a pretrained model
-        if params.reload_model != '':
-            enc_path, dec_path = params.reload_model.split(',')
-            assert not (enc_path == '' and dec_path == '')
-
-            # reload encoder
-            if enc_path != '':
-                logger.info("Reloading encoder from %s ..." % enc_path)
-                enc_reload = torch.load(enc_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
-                enc_reload = enc_reload['model' if 'model' in enc_reload else 'encoder']
-                if all([k.startswith('module.') for k in enc_reload.keys()]):
-                    enc_reload = {k[len('module.'):]: v for k, v in enc_reload.items()}
-
-                # initialize the latent-code relavant weights
-                if params.use_latent_code:
-                    if params.use_weight_network:
-                        if params.z_size != params.emb_dim:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS2
-                        else:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS3
-                    else:
-                        if params.z_size != params.emb_dim:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS1
-                        else:
-                            LATENT_ONLY_PARAMS = []
-                    for name in LATENT_ONLY_PARAMS:
-                        logger.warning("Parameter %s not found." % (name))
-                        enc_reload[name] = encoder.state_dict()[name]
-                encoder.load_state_dict(enc_reload)
-
-            # reload decoder
-            if dec_path != '':
-                logger.info("Reloading decoder from %s ..." % dec_path)
-                dec_reload = torch.load(dec_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
-                dec_reload = dec_reload['model' if 'model' in dec_reload else 'decoder']
-                if all([k.startswith('module.') for k in dec_reload.keys()]):
-                    dec_reload = {k[len('module.'):]: v for k, v in dec_reload.items()}
-                # for i in range(params.n_layers):
-                #     for name in DECODER_ONLY_PARAMS:
-                #         if name % i not in dec_reload:
-                #             logger.warning("Parameter %s not found." % (name % i))
-                #             dec_reload[name % i] = decoder.state_dict()[name % i]
-
-                # initialize the latent-code relavant weights
-                if params.use_latent_code:
-                    if params.use_weight_network:
-                        if params.z_size != params.emb_dim:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS2
-                        else:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS3
-                    else:
-                        if params.z_size != params.emb_dim:
-                            LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS1
-                        else:
-                            LATENT_ONLY_PARAMS = []
-                    for name in LATENT_ONLY_PARAMS:
-                        logger.warning("Parameter %s not found." % (name))
-                        dec_reload[name] = decoder.state_dict()[name]
-
-                decoder.load_state_dict(dec_reload, strict=False)
-
-        # freeze the params in the encoder
-        if params.freeze_encoder:
-            for p in encoder.parameters():
-                p.requires_grad = False
-            # but leave the embeddings to be trainable
-            for name, p in encoder.named_parameters():
-                if name.endswith('embeddings.weight'):
-                    p.requires_grad = True
-
-        logger.debug("Encoder: {}".format(encoder))
-        logger.debug("Decoder: {}".format(decoder))
-        logger.info("Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
-        logger.info("Number of parameters (decoder): %i" % sum([p.numel() for p in decoder.parameters() if p.requires_grad]))
-
-        return encoder.cuda(), decoder.cuda()
-
-
+    encoder, decoders = _build_encoder_decoders(params, dico, n_decoders=1)
+    return to_device(encoder), to_device(decoders[0])
 
 
 def build_model_separate(params, dico):
-    # build
+    """
+    Build an encoder and two decoders: a source decoder (for the first language
+    of --lgs) and a target decoder (for the second one).
+    """
+    encoder, (src_decoder, tgt_decoder) = _build_encoder_decoders(params, dico, n_decoders=2)
+    return to_device(encoder), to_device(src_decoder), to_device(tgt_decoder)
+
+
+def _build_encoder_decoders(params, dico, n_decoders):
+    # build (the order of the constructions is kept, so random initialisations are unchanged)
     encoder = TransformerModel(params, dico, is_encoder=True, with_output=True)  # TODO: only output when necessary - len(params.clm_steps + params.mlm_steps) > 0
-    src_decoder = TransformerModel(params, dico, is_encoder=False, with_output=True)
-    tgt_decoder = TransformerModel(params, dico, is_encoder=False, with_output=True)
+    decoders = [TransformerModel(params, dico, is_encoder=False, with_output=True) for _ in range(n_decoders)]
 
     # reload pretrained word embeddings
     if params.reload_emb != '':
         word2id, embeddings = load_embeddings(params.reload_emb, params)
-        set_pretrain_emb(encoder, dico, word2id, embeddings)
-        set_pretrain_emb(src_decoder, dico, word2id, embeddings)
-        set_pretrain_emb(tgt_decoder, dico, word2id, embeddings)
+        for model in [encoder] + decoders:
+            set_pretrain_emb(model, dico, word2id, embeddings)
 
-    # reload a pretrained model
+    # reload a pretrained model (the same decoder checkpoint initialises every decoder)
     if params.reload_model != '':
         enc_path, dec_path = params.reload_model.split(',')
         assert not (enc_path == '' and dec_path == '')
-
-        # reload encoder
         if enc_path != '':
-            logger.info("Reloading encoder from %s ..." % enc_path)
-            enc_reload = torch.load(enc_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
-            enc_reload = enc_reload['model' if 'model' in enc_reload else 'encoder']
-            if all([k.startswith('module.') for k in enc_reload.keys()]):
-                enc_reload = {k[len('module.'):]: v for k, v in enc_reload.items()}
-
-            # initialize the latent-code relavant weights
-            if params.use_latent_code:
-                if params.use_weight_network:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS2
-                    else:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS3
-                else:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS1
-                    else:
-                        LATENT_ONLY_PARAMS = []
-                for name in LATENT_ONLY_PARAMS:
-                    logger.warning("Parameter %s not found." % (name))
-                    enc_reload[name] = encoder.state_dict()[name]
-            encoder.load_state_dict(enc_reload)
-
-        # reload src decoder
+            reload_encoder(encoder, enc_path)
         if dec_path != '':
-            logger.info("Reloading source decoder from %s ..." % dec_path)
-            dec_reload = torch.load(dec_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
-            dec_reload = dec_reload['model' if 'model' in dec_reload else 'decoder']
-            if all([k.startswith('module.') for k in dec_reload.keys()]):
-                dec_reload = {k[len('module.'):]: v for k, v in dec_reload.items()}
-            # for i in range(params.n_layers):
-            #     for name in DECODER_ONLY_PARAMS:
-            #         if name % i not in dec_reload:
-            #             logger.warning("Parameter %s not found." % (name % i))
-            #             dec_reload[name % i] = src_decoder.state_dict()[name % i]
+            names = ['decoder'] if n_decoders == 1 else ['source decoder', 'target decoder']
+            for decoder, name in zip(decoders, names):
+                reload_decoder(decoder, dec_path, name)
 
-            # initialize the latent-code relavant weights
-            if params.use_latent_code:
-                if params.use_weight_network:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS2
-                    else:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS3
-                else:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS1
-                    else:
-                        LATENT_ONLY_PARAMS = []
-                for name in LATENT_ONLY_PARAMS:
-                    logger.warning("Parameter %s not found." % (name))
-                    dec_reload[name] = src_decoder.state_dict()[name]
-
-            src_decoder.load_state_dict(dec_reload, strict=False)
-
-        # reload tgt decoder
-        if dec_path != '':
-            logger.info("Reloading target decoder from %s ..." % dec_path)
-            dec_reload = torch.load(dec_path, map_location=lambda storage, loc: storage.cuda(params.local_rank))
-            dec_reload = dec_reload['model' if 'model' in dec_reload else 'decoder']
-            if all([k.startswith('module.') for k in dec_reload.keys()]):
-                dec_reload = {k[len('module.'):]: v for k, v in dec_reload.items()}
-
-            # for i in range(params.n_layers):
-            #     for name in DECODER_ONLY_PARAMS:
-            #         if name % i not in dec_reload:
-            #             logger.warning("Parameter %s not found." % (name % i))
-            #             dec_reload[name % i] = tgt_decoder.state_dict()[name % i]
-
-            # initialize the latent-code relavant weights
-            if params.use_latent_code:
-                if params.use_weight_network:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS2
-                    else:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS3
-                else:
-                    if params.z_size != params.emb_dim:
-                        LATENT_ONLY_PARAMS = LATENT_ONLY_PARAMS1
-                    else:
-                        LATENT_ONLY_PARAMS = []
-                for name in LATENT_ONLY_PARAMS:
-                    logger.warning("Parameter %s not found." % (name))
-                    dec_reload[name] = tgt_decoder.state_dict()[name]
-
-            tgt_decoder.load_state_dict(dec_reload, strict=False)
-
-    # freeze the params in the encoder
+    # freeze the params in the encoder (the word / position / language embeddings stay trainable)
     if params.freeze_encoder:
-        for p in encoder.parameters():
-            p.requires_grad = False
-        # but leave the embeddings to be trainable
-        for name, p in encoder.named_parameters():
-            if name.endswith('embeddings.weight'):
-                p.requires_grad = True
-
-    # # tie the weights for the source and target decoder
-    # src_decoder.embeddings.weight = tgt_decoder.embeddings.weight
-    # src_decoder.position_embeddings.weight = tgt_decoder.position_embeddings.weight
-    # src_decoder.lang_embeddings.weight = tgt_decoder.lang_embeddings.weight
-    # src_decoder.pred_layer.proj.weight = src_decoder.embeddings.weight
-    # tgt_decoder.pred_layer.proj.weight = tgt_decoder.embeddings.weight
-
-    # # tie the weights for the encoder
-    # encoder.embeddings.weight = tgt_decoder.embeddings.weight
-    # encoder.position_embeddings.weight = tgt_decoder.position_embeddings.weight
-    # encoder.lang_embeddings.weight = tgt_decoder.lang_embeddings.weight
-    # encoder.pred_layer.proj.weight = encoder.embeddings.weight
+        freeze_encoder(encoder)
 
     logger.debug("Encoder: {}".format(encoder))
-    logger.debug("Decoder: {}".format(src_decoder))
-    logger.debug("Decoder: {}".format(tgt_decoder))
-    logger.info("Number of parameters (encoder): %i" % sum([p.numel() for p in encoder.parameters() if p.requires_grad]))
-    logger.info("Number of parameters (source decoder): %i" % sum([p.numel() for p in src_decoder.parameters() if p.requires_grad]))
-    logger.info("Number of parameters (target decoder): %i" % sum([p.numel() for p in tgt_decoder.parameters() if p.requires_grad]))
+    logger.info("Number of parameters (encoder): %i" % n_trainable_params(encoder))
+    if n_decoders == 1:
+        logger.debug("Decoder: {}".format(decoders[0]))
+        logger.info("Number of parameters (decoder): %i" % n_trainable_params(decoders[0]))
+    else:
+        for decoder, name in zip(decoders, ['source', 'target']):
+            logger.debug("Decoder: {}".format(decoder))
+            logger.info("Number of parameters (%s decoder): %i" % (name, n_trainable_params(decoder)))
 
-    return encoder.cuda(), src_decoder.cuda(), tgt_decoder.cuda()
+    return encoder, decoders

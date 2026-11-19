@@ -1,7 +1,14 @@
-# Output directory
-output/
-Malware_detection_code/
-Malware_detection_files/
+# Experiment dumps (checkpoints, logs), datasets, detector / translation outputs: never committed.
+# (anchored to the repository root: an unanchored "data/" would also ignore the package xlm/data/)
+/dumped/
+/data/
+/output/
+/detector/
+/results/
+
+# Local malware-detection working folders (they contain tensors / models derived from malware samples)
+/Malware_detection_code/
+/Malware_detection_files/
 
 # Python
 __pycache__/
@@ -57,6 +64,11 @@ dmypy.json
 Thumbs.db
 .DS_Store
 
-# Logs
+# paper
+/paper/
+
+# Logs / checkpoints
 *.log
+*.pth
+*.pt
 

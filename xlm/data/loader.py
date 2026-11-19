@@ -57,7 +57,8 @@ def load_binarized(path, params):
     """
     assert path.endswith('.pth')
     if params.debug_train:
-        path = path.replace('train', 'valid')
+        d, b = os.path.split(path)
+        path = os.path.join(d, b.replace('train', 'valid', 1))
     if getattr(params, 'multi_gpu', False):
         split_path = '%s.%i.pth' % (path[:-4], params.local_rank)
         if os.path.isfile(split_path):
@@ -65,7 +66,7 @@ def load_binarized(path, params):
             path = split_path
     assert os.path.isfile(path), path
     logger.info("Loading data from %s ..." % path)
-    data = torch.load(path)
+    data = torch.load(path, weights_only=False)  # pickled Dictionary + numpy arrays
     data = process_binarized(data, params)
     return data
 
@@ -298,7 +299,9 @@ def check_data_params(params):
 
     # check parallel datasets
     required_para_train = set(params.clm_steps + params.mlm_steps + params.pc_steps + params.mt_steps)
-    required_para = required_para_train | set([(l2, l3) for _, l2, l3 in params.bt_steps])# this line does not really require parallel dataset for l2 and l3
+    required_para = required_para_train | set([(l2, l3) for _, l2, l3 in params.bt_steps])
+    # NOTE: back-translation does not need *training* parallel data for (l2, l3), but their valid / test
+    # parallel files are required (they are used to evaluate the translations), see `para_dataset` below
     params.para_dataset = {
         (src, tgt): {
             splt: (os.path.join(params.data_path, '%s.%s-%s.%s.pth' % (splt, src, tgt, src)),

@@ -8,28 +8,35 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-
 """
-Example: python data/vocab.txt data/train.txt
-vocab.txt: 1stline=word, 2ndline=count
+Binarize a (BPE-segmented) text file with a vocabulary.
+
+    python preprocess.py <vocab.txt> <data.txt>
+
+vocab.txt : one "<token> <count>" pair per line (e.g. the output of fastBPE `getvocab`)
+data.txt  : one sentence per line, tokens separated by spaces
+Output    : <data.txt>.pth, next to the input file. An already existing .pth is re-used, delete it to
+            re-binarize.
+
+The training scripts expect the following layout inside --data_path
+(binarize every text file once, the names below are the *text* files):
+    train.<lang>   valid.<lang>   test.<lang>                      monolingual data
+    valid.<l1>-<l2>.<l1>  valid.<l1>-<l2>.<l2>                      parallel data used for evaluation
+    test.<l1>-<l2>.<l1>   test.<l1>-<l2>.<l2>                       (l1 < l2 alphabetically, same number of lines)
 """
 
 import os
-import sys
-#import xlm.logger
+import argparse
+
 from xlm.logger import create_logger
 from xlm.data.dictionary import Dictionary
-#from xlm import create_logger
-#from xlm import Dictionary
 
-if __name__ == '__main__':
 
+def main(voc_path, txt_path):
     logger = create_logger(None, 0)
-    voc_path = sys.argv[1]
-    txt_path = sys.argv[2]
-    bin_path = sys.argv[2] + '.pth'
-    assert os.path.isfile(voc_path)
-    assert os.path.isfile(txt_path)
+    assert os.path.isfile(voc_path), voc_path
+    assert os.path.isfile(txt_path), txt_path
+    bin_path = txt_path + '.pth'
 
     dico = Dictionary.read_vocab(voc_path)
     logger.info("")
@@ -49,3 +56,11 @@ if __name__ == '__main__':
         if len(data['unk_words']) < 30:
             for w, c in sorted(data['unk_words'].items(), key=lambda x: x[1])[::-1]:
                 logger.info("%s: %i" % (w, c))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Binarize a text file with a vocabulary (see module docstring).")
+    parser.add_argument("vocab", help="vocabulary file, one '<token> <count>' per line")
+    parser.add_argument("text", help="text file to binarize; <text>.pth is written")
+    args = parser.parse_args()
+    main(args.vocab, args.text)

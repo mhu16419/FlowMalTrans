@@ -6,6 +6,7 @@
 #
 
 import os
+import sys
 import math
 import time
 from logging import getLogger
@@ -15,11 +16,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
-import apex
+
+try:  # NVIDIA apex is only needed for --amp >= 0 (apex.amp / apex DDP); the default is --amp -1
+    import apex
+except ImportError:
+    apex = None
 
 from .optim import get_optimizer
 from .utils import to_cuda, concat_batches, find_modules
-from .utils import parse_lambda_config, update_lambdas
+from .utils import parse_lambda_config, update_lambdas, get_latent_code
 from .model.memory import HashingMemory
 from .model.transformer import TransformerFFN
 
@@ -34,10 +39,9 @@ class Trainer(object):
         Initialize trainer.
         """
         # epoch / iteration size
-        self.epoch_size = params.epoch_size * params.accumulate_gradients # if accumulate gradients is more than 1, maybe we want more setences in one epoch
-        if self.epoch_size == -1:
-            self.epoch_size = self.data
-            assert self.epoch_size > 0
+        # with gradient accumulation, an epoch contains accumulate_gradients times more sentences
+        assert params.epoch_size > 0
+        self.epoch_size = params.epoch_size * params.accumulate_gradients
 
         # data iterators
         self.iterators = {}
@@ -56,7 +60,7 @@ class Trainer(object):
 
         # float16 / distributed (no AMP)
         assert params.amp >= 1 or not params.fp16
-        # assert params.amp >= 0 or params.accumulate_gradients == 1
+        assert params.amp == -1 or apex is not None, "--amp >= 0 requires NVIDIA apex (https://github.com/NVIDIA/apex)"
         if params.multi_gpu and params.amp == -1:
             logger.info("Using nn.parallel.DistributedDataParallel ...")
             for name in self.MODEL_NAMES:
@@ -126,7 +130,7 @@ class Trainer(object):
         self.last_time = time.time()
 
         # reload potential checkpoints
-        self.reload_checkpoint(params.is_checkpoint)
+        self.reload_checkpoint(getattr(params, 'is_checkpoint', True))
 
         # initialize lambda coefficients and their configurations
         parse_lambda_config(params)
@@ -197,18 +201,15 @@ class Trainer(object):
         """
         names = self.optimizers.keys()
         optimizers = [self.optimizers[k] for k in names]
+
         # check NaN
         if (loss != loss).data.any():
             logger.warning("NaN detected")
             for optimizer in optimizers:
                 optimizer.zero_grad()
             return
-            # exit()
 
         params = self.params
-
-        # optimizers
-        
 
         # regular optimization
         if params.amp == -1:
@@ -216,10 +217,7 @@ class Trainer(object):
                 loss.backward()
                 if params.clip_grad_norm > 0:
                     for name in names:
-                        # norm_check_a = (sum([p.grad.norm(p=2).item() ** 2 for p in self.parameters[name]])) ** 0.5
                         clip_grad_norm_(self.parameters[name], params.clip_grad_norm)
-                        # norm_check_b = (sum([p.grad.norm(p=2).item() ** 2 for p in self.parameters[name]])) ** 0.5
-                        # print(name, norm_check_a, norm_check_b)
                 for optimizer in optimizers:
                     optimizer.step()
                     optimizer.zero_grad()
@@ -233,10 +231,7 @@ class Trainer(object):
                     scaled_loss.backward()
                 if params.clip_grad_norm > 0:
                     for name in names:
-                        # norm_check_a = (sum([p.grad.norm(p=2).item() ** 2 for p in apex.amp.master_params(self.optimizers[name])])) ** 0.5
                         clip_grad_norm_(apex.amp.master_params(self.optimizers[name]), params.clip_grad_norm)
-                        # norm_check_b = (sum([p.grad.norm(p=2).item() ** 2 for p in apex.amp.master_params(self.optimizers[name])])) ** 0.5
-                        # print(name, norm_check_a, norm_check_b)
                 for optimizer in optimizers:
                     optimizer.step()
                     optimizer.zero_grad()
@@ -436,12 +431,12 @@ class Trainer(object):
         # define target words to predict
         if params.sample_alpha == 0:
             pred_mask = np.random.rand(slen, bs) <= params.word_pred
-            pred_mask = torch.from_numpy(pred_mask.astype(np.uint8))
+            pred_mask = torch.from_numpy(pred_mask.astype(bool))
         else:
             x_prob = params.mask_scores[x.flatten()]
             n_tgt = math.ceil(params.word_pred * slen * bs)
             tgt_ids = np.random.choice(len(x_prob), n_tgt, replace=False, p=x_prob / x_prob.sum())
-            pred_mask = torch.zeros(slen * bs, dtype=torch.uint8)
+            pred_mask = torch.zeros(slen * bs, dtype=torch.bool)
             pred_mask[tgt_ids] = 1
             pred_mask = pred_mask.view(slen, bs)
 
@@ -509,23 +504,27 @@ class Trainer(object):
         data = {
             'epoch': self.epoch,
             'n_total_iter': self.n_total_iter,
-            #'best_metrics': self.best_metrics,
-            #'best_stopping_criterion': self.best_stopping_criterion,
+            'best_metrics': self.best_metrics,
+            'best_stopping_criterion': self.best_stopping_criterion,
         }
 
-        for name in self.MODEL_NAMES:
-            logger.warning(f"Saving {name} parameters ...")
-            data[name] = getattr(self, name).state_dict()
+        for model_name in self.MODEL_NAMES:
+            logger.info(f"Saving {model_name} parameters ...")
+            # unwrap DistributedDataParallel so that keys never carry a 'module.' prefix (needed by translate*.py)
+            model = getattr(self, model_name)
+            data[model_name] = (model.module if self.params.multi_gpu else model).state_dict()
 
         if include_optimizers:
-            for name in self.optimizers.keys():
-                logger.warning(f"Saving {name} optimizer ...")
-                data[f'{name}_optimizer'] = self.optimizers[name].state_dict()
+            for opt_name in self.optimizers.keys():
+                logger.info(f"Saving {opt_name} optimizer ...")
+                data[f'{opt_name}_optimizer'] = self.optimizers[opt_name].state_dict()
 
         data['dico_id2word'] = self.data['dico'].id2word
         data['dico_word2id'] = self.data['dico'].word2id
         data['dico_counts'] = self.data['dico'].counts
-        data['params'] = {k: v for k, v in self.params.__dict__.items()}
+        # `pred_probs` / `mask_scores` are helper tensors / arrays created in __init__: not worth saving, and
+        # they would make the checkpoint un-loadable with torch.load(weights_only=True)
+        data['params'] = {k: v for k, v in self.params.__dict__.items() if k not in ('pred_probs', 'mask_scores')}
 
         torch.save(data, path)
 
@@ -541,34 +540,49 @@ class Trainer(object):
                 checkpoint_path = self.params.reload_checkpoint
                 assert os.path.isfile(checkpoint_path)
         logger.warning(f"Reloading checkpoint from {checkpoint_path} ...")
-        data = torch.load(checkpoint_path, map_location='cpu')
+        # the checkpoint stores the full params dict (numpy array, torch tensor), so it is not loadable with
+        # weights_only=True (the default of torch >= 2.6). Only reload checkpoints that you trust.
+        data = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
         # reload model parameters
-        for name in self.MODEL_NAMES:
-            getattr(self, name).load_state_dict(data[name])
+        for model_name in self.MODEL_NAMES:
+            model = getattr(self, model_name)
+            state_dict = data[model_name]
+            if self.params.multi_gpu:
+                model = model.module
+            if all(k.startswith('module.') for k in state_dict.keys()):  # checkpoint saved from a DDP-wrapped model
+                state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
 
         # if load checkpoint where optimizers are available
         if checkpoint:
-            # reload optimizers
-            for name in self.optimizers.keys():
-                if False:  # AMP checkpoint reloading is buggy, we cannot do that - TODO: fix - https://github.com/NVIDIA/apex/issues/250
-                    logger.warning(f"Reloading checkpoint optimizer {name} ...")
-                    self.optimizers[name].load_state_dict(data[f'{name}_optimizer'])
-                else:  # instead, we only reload current iterations / learning rates
-                    logger.warning(f"Not reloading checkpoint optimizer {name}.")
-                    for group_id, param_group in enumerate(self.optimizers[name].param_groups):
-                        if 'num_updates' not in param_group:
-                            logger.warning(f"No 'num_updates' for optimizer {name}.")
-                            continue
-                        logger.warning(f"Reloading 'num_updates' and 'lr' for optimizer {name}.")
-                        param_group['num_updates'] = data[f'{name}_optimizer']['param_groups'][group_id]['num_updates']
-                        param_group['lr'] = self.optimizers[name].get_lr_for_step(param_group['num_updates'])
+            # reload optimizers: we only reload current iterations / learning rates
+            # (AMP checkpoint reloading is buggy - https://github.com/NVIDIA/apex/issues/250)
+            for opt_name, optimizer in self.optimizers.items():
+                opt_state = data.get(f'{opt_name}_optimizer')
+                if opt_state is None:  # e.g. periodic checkpoints written without optimizers
+                    logger.warning(f"No state for optimizer {opt_name} in the checkpoint: its learning-rate schedule "
+                                   f"restarts from step 0 (warm-up).")
+                    continue
+                logger.warning(f"Not reloading checkpoint optimizer {opt_name}.")
+                for group_id, param_group in enumerate(optimizer.param_groups):
+                    if 'num_updates' not in param_group:
+                        logger.warning(f"No 'num_updates' for optimizer {opt_name}.")
+                        continue
+                    logger.warning(f"Reloading 'num_updates' and 'lr' for optimizer {opt_name}.")
+                    param_group['num_updates'] = opt_state['param_groups'][group_id]['num_updates']
+                    param_group['lr'] = optimizer.get_lr_for_step(param_group['num_updates'])
 
             # reload main metrics
             self.epoch = data['epoch'] + 1
             self.n_total_iter = data['n_total_iter']
-            #self.best_metrics = data['best_metrics']
-            #self.best_stopping_criterion = data['best_stopping_criterion']
+            # 'best_metrics' / 'best_stopping_criterion' are absent in checkpoints written by the
+            # working copy of this repo (paper runs) and may be None / {} for a different setup
+            for metric, value in (data.get('best_metrics') or {}).items():
+                if metric in self.best_metrics:
+                    self.best_metrics[metric] = value
+            if self.stopping_criterion is not None and data.get('best_stopping_criterion') is not None:
+                self.best_stopping_criterion = data['best_stopping_criterion']
             logger.warning(f"Checkpoint reloaded. Resuming at epoch {self.epoch} / iteration {self.n_total_iter} ...")
 
     def save_periodic(self):
@@ -601,25 +615,30 @@ class Trainer(object):
         End the epoch.
         """
         # stop if the stopping criterion has not improved after a certain number of epochs
-        # if self.stopping_criterion is not None and (self.params.is_master or not self.stopping_criterion[0].endswith('_mt_bleu')):
-        #     metric, biggest = self.stopping_criterion
-        #     assert metric in scores, metric
-        #     factor = 1 if biggest else -1
-        #     if factor * scores[metric] > factor * self.best_stopping_criterion:
-        #         self.best_stopping_criterion = scores[metric]
-        #         logger.info("New best validation score: %f" % self.best_stopping_criterion)
-        #         self.decrease_counts = 0
-        #     else:
-        #         logger.info("Not a better validation score (%i / %i)."
-        #                     % (self.decrease_counts, self.decrease_counts_max))
-        #         self.decrease_counts += 1
-        #     if self.decrease_counts > self.decrease_counts_max:
-        #         logger.info("Stopping criterion has been below its best value for more "
-        #                     "than %i epochs. Ending the experiment..." % self.decrease_counts_max)
-        #         if self.params.multi_gpu and 'SLURM_JOB_ID' in os.environ:
-        #             os.system('scancel ' + os.environ['SLURM_JOB_ID'])
-        #         exit()
-        # self.save_checkpoint('checkpoint', include_optimizers=True)
+        # (only active with --stopping_criterion "<metric>,<n_epochs>", which needs `scores` to contain <metric>)
+        if self.stopping_criterion is not None and (self.params.is_master or not self.stopping_criterion[0].endswith('_mt_bleu')):
+            metric, biggest = self.stopping_criterion
+            assert metric in scores, metric
+            factor = 1 if biggest else -1
+            if factor * scores[metric] > factor * self.best_stopping_criterion:
+                self.best_stopping_criterion = scores[metric]
+                logger.info("New best validation score: %f" % self.best_stopping_criterion)
+                self.decrease_counts = 0
+            else:
+                logger.info("Not a better validation score (%i / %i)."
+                            % (self.decrease_counts, self.decrease_counts_max))
+                self.decrease_counts += 1
+            if self.decrease_counts > self.decrease_counts_max:
+                logger.info("Stopping criterion has been below its best value for more "
+                            "than %i epochs. Ending the experiment..." % self.decrease_counts_max)
+                if self.params.multi_gpu and 'SLURM_JOB_ID' in os.environ:
+                    os.system('scancel ' + os.environ['SLURM_JOB_ID'])
+                sys.exit()
+
+        # optional 'checkpoint.pth' (with optimizers) used for automatic resuming from the same dump_path.
+        # Off by default: the paper runs only wrote periodic-<epoch>.pth (see save_periodic) and resumed with --reload_checkpoint.
+        if getattr(self.params, 'save_last_checkpoint', False):
+            self.save_checkpoint('checkpoint', include_optimizers=True)
         self.epoch += 1
 
     def round_batch(self, x, lengths, positions, langs):
@@ -662,6 +681,22 @@ class Trainer(object):
         assert x.size(1) % 8 == 0
         return x, lengths, positions, langs, idx
 
+    def get_lm_model(self, lang1, lang2, objective):
+        """
+        Return the (possibly DDP-wrapped) model trained / evaluated by the CLM ('clm') or MLM ('mlm') objective.
+        - encoder_only (vanilla XLM pre-training): the single transformer
+        - separate_decoders (paper runs): a decoder is trained as a language model, bidirectionally for MLM.
+          NOTE: `lang2 == lang1` is never true for monolingual steps (lang2 is None), so CLM / MLM on a
+          single language always trains the *target* decoder. This is kept as is to reproduce the paper runs.
+        - otherwise (original XLM): CLM -> decoder, MLM -> encoder
+        """
+        params = self.params
+        if params.encoder_only:
+            return self.model
+        if getattr(params, 'separate_decoders', False):
+            return self.src_decoder if lang2 == lang1 else self.tgt_decoder
+        return self.decoder if objective == 'clm' else self.encoder
+
     def clm_step(self, lang1, lang2, lambda_coeff):
         """
         Next word prediction step (causal prediction).
@@ -671,15 +706,7 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
-        model = getattr(self, name)
-        if params.separate_decoders:
-            if lang2 == lang1:
-                model = self.src_decoder
-            else:
-                model = self.tgt_decoder
-        else:
-            model = self.decoder
+        model = self.get_lm_model(lang1, lang2, 'clm')
         model.train()
 
         # generate batch / select words to predict
@@ -718,16 +745,7 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
-        #model = getattr(self, name)
-        if params.separate_decoders:
-            if lang2 == lang1:
-                model = self.src_decoder
-            else:
-                model = self.tgt_decoder
-        else:
-            model = self.decoder
-        
+        model = self.get_lm_model(lang1, lang2, 'mlm')
         model.train()
 
         # generate batch / select words to predict
@@ -908,61 +926,12 @@ class EncDecTrainer(Trainer):
         enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
         enc1 = enc1.transpose(0, 1)
 
-        # print(x1.size())  # LongTensor(slen, bs)
-        # print(enc1.size())  #(bs, slen, emb_dim)
-        # enc1 should now have the size (batch_size, seq_len, embedding_dim)
+        # enc1: (batch_size, seq_len, emb_dim)
 
         # obtain the sentence-level latent code from enc1
         z = None
         if params.use_latent_code:
-            use_mean_pooling = params.use_mean_pooling
-            use_max_pooling = params.use_max_pooling
-            use_CSL = params.use_CSL
-            if not use_mean_pooling and not use_max_pooling and not use_CSL:
-                raise ValueError('There must at least be one method to obtain the sentence level latent code')
-            if params.use_mean_pooling:
-                # h_enc: [B, Embedding dim]
-                h_enc_mean = F.avg_pool1d(enc1.transpose(1, 2).contiguous(),
-                                          enc1.size(1)).squeeze(2)
-            if params.use_max_pooling:
-                h_enc_max = F.max_pool1d(enc1.transpose(1, 2).contiguous(),
-                                         enc1.size(1)).squeeze(2)
-            if params.use_CSL:
-                h_enc_CSL = enc1[:, 0]
-
-            # whether concat the hs or add the hs
-            if params.concat_h:
-                if params.use_mean_pooling:
-                    h_enc = h_enc_mean
-                    if use_max_pooling:
-                        h_enc = torch.cat([h_enc, h_enc_max], dim=-1)
-                    if use_CSL:
-                        h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                elif params.use_max_pooling:
-                    h_enc = h_enc_max
-                    if use_CSL:
-                        h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                else:  # only use the CSL
-                    h_enc = h_enc_CSL
-            else:
-                if params.use_mean_pooling:
-                    h_enc = h_enc_mean
-                    if use_max_pooling:
-                        h_enc += h_enc_max
-                    if use_CSL:
-                        h_enc += h_enc_CSL
-                elif params.use_max_pooling:
-                    h_enc = h_enc_max
-                    if use_CSL:
-                        h_enc += h_enc_CSL
-                else:  # only use the CSL
-                    h_enc = h_enc_CSL
-
-            # check whether projection from n*emb_dim to z_size is needed
-            if params.use_h2z_matrix:
-                z = self.shared_h2z_projection(h_enc)
-            else:
-                z = h_enc
+            z = get_latent_code(enc1, params, self.shared_h2z_projection if params.use_h2z_matrix else None)
 
             if params.use_flow:
                 if lang1 == self.used_lang1:
@@ -977,9 +946,7 @@ class EncDecTrainer(Trainer):
                 log_prob_prior = -1 / 2 * (math.log(2 * math.pi) + eps.pow(2)).sum(-1)  # [B]
                 log_density = log_prob_prior + log_det
                 nll_loss = -log_density.mean() * params.nll_weight
-                # self.optimize(nll_loss)
 
-        # print(z.size())  # [bs, z_size]
         # decode target sentence
         if params.separate_decoders:
             if lang2 == self.used_lang1:
@@ -1071,54 +1038,7 @@ class EncDecTrainer(Trainer):
              # obtain the sentence-level latent code from enc1
             z = None
             if params.use_latent_code:
-                use_mean_pooling = params.use_mean_pooling
-                use_max_pooling = params.use_max_pooling
-                use_CSL = params.use_CSL
-                if not use_mean_pooling and not use_max_pooling and not use_CSL:
-                    raise ValueError('There must at least be one method to obtain the sentence level latent code')
-                if params.use_mean_pooling:
-                    # h_enc: [B, Embedding dim]
-                    h_enc_mean = F.avg_pool1d(enc1.transpose(1, 2).contiguous(),
-                                              enc1.size(1)).squeeze(2)
-                if params.use_max_pooling:
-                    h_enc_max = F.max_pool1d(enc1.transpose(1, 2).contiguous(),
-                                             enc1.size(1)).squeeze(2)
-                if params.use_CSL:
-                    h_enc_CSL = enc1[:, 0]
-
-                # whether concat the hs or add the hs
-                if params.concat_h:
-                    if params.use_mean_pooling:
-                        h_enc = h_enc_mean
-                        if use_max_pooling:
-                            h_enc = torch.cat([h_enc, h_enc_max], dim=-1)
-                        if use_CSL:
-                            h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                    elif params.use_max_pooling:
-                        h_enc = h_enc_max
-                        if use_CSL:
-                            h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                    else:  # only use the CSL
-                        h_enc = h_enc_CSL
-                else:
-                    if params.use_mean_pooling:
-                        h_enc = h_enc_mean
-                        if use_max_pooling:
-                            h_enc += h_enc_max
-                        if use_CSL:
-                            h_enc += h_enc_CSL
-                    elif params.use_max_pooling:
-                        h_enc = h_enc_max
-                        if use_CSL:
-                            h_enc += h_enc_CSL
-                    else:  # only use the CSL
-                        h_enc = h_enc_CSL
-
-                # check whether projection from n*emb_dim to z_size is needed
-                if params.use_h2z_matrix:
-                    z = _shared_h2z_projection(h_enc)
-                else:
-                    z = h_enc
+                z = get_latent_code(enc1, params, _shared_h2z_projection if params.use_h2z_matrix else None)
 
                 # here is from lang1 to lang2
                 if params.use_flow:
@@ -1174,54 +1094,7 @@ class EncDecTrainer(Trainer):
         # compute the latent code
         z = None
         if params.use_latent_code:
-            use_mean_pooling = params.use_mean_pooling
-            use_max_pooling = params.use_max_pooling
-            use_CSL = params.use_CSL
-            if not use_mean_pooling and not use_max_pooling and not use_CSL:
-                raise ValueError('There must at least be one method to obtain the sentence level latent code')
-            if params.use_mean_pooling:
-                # h_enc: [B, Embedding dim]
-                h_enc_mean = F.avg_pool1d(enc2.transpose(1, 2).contiguous(),
-                                          enc2.size(1)).squeeze(2)
-            if params.use_max_pooling:
-                h_enc_max = F.max_pool1d(enc2.transpose(1, 2).contiguous(),
-                                         enc2.size(1)).squeeze(2)
-            if params.use_CSL:
-                h_enc_CSL = enc2[:, 0]
-
-            # whether concat the hs or add the hs
-            if params.concat_h:
-                if params.use_mean_pooling:
-                    h_enc = h_enc_mean
-                    if use_max_pooling:
-                        h_enc = torch.cat([h_enc, h_enc_max], dim=-1)
-                    if use_CSL:
-                        h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                elif params.use_max_pooling:
-                    h_enc = h_enc_max
-                    if use_CSL:
-                        h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                else:  # only use the CSL
-                    h_enc = h_enc_CSL
-            else:
-                if params.use_mean_pooling:
-                    h_enc = h_enc_mean
-                    if use_max_pooling:
-                        h_enc += h_enc_max
-                    if use_CSL:
-                        h_enc += h_enc_CSL
-                elif params.use_max_pooling:
-                    h_enc = h_enc_max
-                    if use_CSL:
-                        h_enc += h_enc_CSL
-                else:  # only use the CSL
-                    h_enc = h_enc_CSL
-
-            # check whether projection from n*emb_dim to z_size is needed
-            if params.use_h2z_matrix:
-                z = self.shared_h2z_projection(h_enc)
-            else:
-                z = h_enc
+            z = get_latent_code(enc2, params, self.shared_h2z_projection if params.use_h2z_matrix else None)
 
             # here is from lang2 to lang3
             # lang3 == lang1

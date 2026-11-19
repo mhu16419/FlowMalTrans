@@ -65,23 +65,19 @@ class Adam(optim.Optimizer):
 
                 state['step'] += 1
 
-                # if group['weight_decay'] != 0:
-                #     grad.add_(group['weight_decay'], p.data)
-
                 # Decay the first and second moment running average coefficient
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 denom = exp_avg_sq.sqrt().add_(group['eps'])
-                # denom = exp_avg_sq.sqrt().clamp_(min=group['eps'])
 
-                bias_correction1 = 1 - beta1 ** state['step']  # .item()
-                bias_correction2 = 1 - beta2 ** state['step']  # .item()
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
                 if group['weight_decay'] != 0:
-                    p.data.add_(-group['weight_decay'] * group['lr'], p.data)
+                    p.data.add_(p.data, alpha=-group['weight_decay'] * group['lr'])
 
-                p.data.addcdiv_(-step_size, exp_avg, denom)
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
 
@@ -221,7 +217,7 @@ def get_optimizer(parameters, s):
         for x in s[s.find(',') + 1:].split(','):
             split = x.split('=')
             assert len(split) == 2
-            assert re.match("^[+-]?(\d+(\.\d*)?|\.\d+)$", split[1]) is not None
+            assert re.match(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$", split[1]) is not None
             optim_params[split[0]] = float(split[1])
     else:
         method = s
@@ -261,7 +257,7 @@ def get_optimizer(parameters, s):
         raise Exception('Unknown optimization method: "%s"' % method)
 
     # check that we give good parameters to the optimizer
-    expected_args = inspect.getargspec(optim_fn.__init__)[0]
+    expected_args = inspect.getfullargspec(optim_fn.__init__)[0]
     assert expected_args[:2] == ['self', 'params']
     if not all(k in expected_args[2:] for k in optim_params.keys()):
         raise Exception('Unexpected parameters: expected "%s", got "%s"' % (

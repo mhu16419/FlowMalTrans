@@ -197,7 +197,7 @@ class Dataset(object):
         Return a sentences iterator.
         """
         assert seed is None or shuffle is True and type(seed) is int
-        rng = np.random.RandomState(seed)
+        rng = np.random if seed is None else np.random.RandomState(seed)  # seed=None: the global (--seed) generator
         n_sentences = len(self.pos) if n_sentences == -1 else n_sentences
         assert 0 < n_sentences <= len(self.pos)
         assert type(shuffle) is bool and type(group_by_size) is bool
@@ -261,7 +261,6 @@ class ParallelDataset(Dataset):
         assert len(self.pos2) == (self.sent2 == self.eos_index).sum()
 
         # remove empty sentences
-        #this line is manually commented.
         self.remove_empty_sentences()
 
         # sanity checks
@@ -291,24 +290,9 @@ class ParallelDataset(Dataset):
         Remove empty sentences.
         """
         init_size = len(self.pos1)
-        # print(f"Initial size: {init_size}")
-        # print(f"self.lengths1 size: {len(self.lengths1)}")
-        # print(f"self.lengths2 size: {len(self.lengths2)}")
         indices = np.arange(len(self.pos1))
-        # print(f"indices length: {len(indices)}")
-        
-        # non_empty_indices1 = indices[self.lengths1[indices] > 0]
-        # print(f"Non-empty indices1 size: {len(non_empty_indices1)}")
-        
-        # non_empty_indices2 = indices[self.lengths2[indices] > 0]
-        # print(f"Non-empty indices2 size: {len(non_empty_indices2)}")
-
-
-        #The following line is new added:
-        indices = indices[(self.lengths2[indices] > 0) & (self.lengths1[indices] > 0)]
-        print(f"Final indices size: {len(indices)}")
-        #indices = indices[self.lengths1[indices] > 0]
-        #indices = indices[self.lengths2[indices] > 0]
+        indices = indices[self.lengths1[indices] > 0]
+        indices = indices[self.lengths2[indices] > 0]
         self.pos1 = self.pos1[indices]
         self.pos2 = self.pos2[indices]
         self.lengths1 = self.pos1[:, 1] - self.pos1[:, 0]

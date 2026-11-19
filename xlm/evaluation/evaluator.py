@@ -12,8 +12,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import math
-from torch.nn import functional as F
-from ..utils import to_cuda, restore_segmentation, concat_batches
+from ..utils import to_cuda, restore_segmentation, concat_batches, get_latent_code
 from ..model.memory import HashingMemory
 
 
@@ -97,7 +96,7 @@ class Evaluator(object):
         # create directory to store hypotheses, and reference files for BLEU evaluation
         if self.params.is_master:
             params.hyp_path = os.path.join(params.dump_path, 'hypotheses')
-            subprocess.Popen('mkdir -p %s' % params.hyp_path, shell=True).wait()
+            os.makedirs(params.hyp_path, exist_ok=True)
             self.create_reference_files()
 
     def get_iterator(self, data_set, lang1, lang2=None, stream=False):
@@ -111,7 +110,6 @@ class Evaluator(object):
 
         # hacks to reduce evaluation time when using many languages
         if len(self.params.langs) > 30:
-            eval_lgs = set(["ar", "bg", "de", "el", "en", "es", "fr", "hi", "ru", "sw", "th", "tr", "ur", "vi", "zh", "ab", "ay", "bug", "ha", "ko", "ln", "min", "nds", "pap", "pt", "tg", "to", "udm", "uk", "zh_classical"])
             eval_lgs = set(["ar", "bg", "de", "el", "en", "es", "fr", "hi", "ru", "sw", "th", "tr", "ur", "vi", "zh"])
             subsample = 10 if (data_set == 'test' or lang1 not in eval_lgs) else 5
             n_sentences = 600 if (data_set == 'test' or lang1 not in eval_lgs) else 1500
@@ -204,7 +202,7 @@ class Evaluator(object):
             if not np.any(to_predict[:lengths[i] - 1, i]):
                 v = rng.randint(1, lengths[i] - 1)
                 to_predict[v, i] = 1
-        pred_mask = torch.from_numpy(to_predict.astype(np.uint8))
+        pred_mask = torch.from_numpy(to_predict.astype(bool))
 
         # generate possible targets / update x input
         _x_real = x[pred_mask]
@@ -229,14 +227,14 @@ class Evaluator(object):
             for data_set in ['valid', 'test']:
 
                 # causal prediction task (evaluate perplexity and accuracy)
-                # for lang1, lang2 in params.clm_steps:
-                #     self.evaluate_clm(scores, data_set, lang1, lang2)
+                for lang1, lang2 in params.clm_steps:
+                    self.evaluate_clm(scores, data_set, lang1, lang2)
 
                 # prediction task (evaluate perplexity and accuracy)
-                # for lang1, lang2 in params.mlm_steps:
-                #     self.evaluate_mlm(scores, data_set, lang1, lang2)
+                for lang1, lang2 in params.mlm_steps:
+                    self.evaluate_mlm(scores, data_set, lang1, lang2)
 
-                #machine translation task (evaluate perplexity and accuracy)
+                # machine translation task (evaluate perplexity and accuracy)
                 for lang1, lang2 in set(params.mt_steps + [(l2, l3) for _, l2, l3 in params.bt_steps]):
                     eval_bleu = params.eval_bleu and params.is_master
                     self.evaluate_mt(scores, data_set, lang1, lang2, eval_bleu)
@@ -262,7 +260,7 @@ class Evaluator(object):
         assert lang1 in params.langs
         assert lang2 in params.langs or lang2 is None
 
-        model = self.model if params.encoder_only else self.decoder
+        model = self.trainer.get_lm_model(lang1, lang2, 'clm')  # same model as Trainer.clm_step
         model.eval()
         model = model.module if params.multi_gpu else model
 
@@ -335,7 +333,7 @@ class Evaluator(object):
         assert lang1 in params.langs
         assert lang2 in params.langs or lang2 is None
 
-        model = self.model if params.encoder_only else self.encoder
+        model = self.trainer.get_lm_model(lang1, lang2, 'mlm')  # same model as Trainer.mlm_step
         model.eval()
         model = model.module if params.multi_gpu else model
 
@@ -464,7 +462,6 @@ class EncDecEvaluator(Evaluator):
             src_flow = self.src_flow.module if params.multi_gpu else self.src_flow
             tgt_flow = self.tgt_flow.module if params.multi_gpu else self.tgt_flow
 
-        params = params
         lang1_id = params.lang2id[lang1]
         lang2_id = params.lang2id[lang2]
 
@@ -512,54 +509,7 @@ class EncDecEvaluator(Evaluator):
 
             z = None
             if params.use_latent_code:
-                use_mean_pooling = params.use_mean_pooling
-                use_max_pooling = params.use_max_pooling
-                use_CSL = params.use_CSL
-                if not use_mean_pooling and not use_max_pooling and not use_CSL:
-                    raise ValueError('There must at least be one method to obtain the sentence level latent code')
-                if params.use_mean_pooling:
-                    # h_enc: [B, Embedding dim]
-                    h_enc_mean = F.avg_pool1d(enc1.transpose(1, 2).contiguous(),
-                                              enc1.size(1)).squeeze(2)
-                if params.use_max_pooling:
-                    h_enc_max = F.max_pool1d(enc1.transpose(1, 2).contiguous(),
-                                             enc1.size(1)).squeeze(2)
-                if params.use_CSL:
-                    h_enc_CSL = enc1[:, 0]
-
-               # whether concat the hs or add the hs
-                if params.concat_h:
-                    if params.use_mean_pooling:
-                        h_enc = h_enc_mean
-                        if use_max_pooling:
-                            h_enc = torch.cat([h_enc, h_enc_max], dim=-1)
-                        if use_CSL:
-                            h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                    elif params.use_max_pooling:
-                        h_enc = h_enc_max
-                        if use_CSL:
-                            h_enc = torch.cat([h_enc, h_enc_CSL], dim=-1)
-                    else:  # only use the CSL
-                        h_enc = h_enc_CSL
-                else:
-                    if params.use_mean_pooling:
-                        h_enc = h_enc_mean
-                        if use_max_pooling:
-                            h_enc += h_enc_max
-                        if use_CSL:
-                            h_enc += h_enc_CSL
-                    elif params.use_max_pooling:
-                        h_enc = h_enc_max
-                        if use_CSL:
-                            h_enc += h_enc_CSL
-                    else:  # only use the CSL
-                        h_enc = h_enc_CSL
-
-                # check whether projection from n*emb_dim to z_size is needed
-                if params.use_h2z_matrix:
-                    z = shared_h2z_projection(h_enc)
-                else:
-                    z = h_enc
+                z = get_latent_code(enc1, params, shared_h2z_projection if params.use_h2z_matrix else None)
 
                 if params.use_flow:
                     if lang1 == self.used_lang1 and lang2 == self.used_lang2:
@@ -629,7 +579,6 @@ class EncDecEvaluator(Evaluator):
 
         # compute the nll of the dataset
         avg_nll_loss = nll_loss / n_val_sentences
-        print(avg_nll_loss)
         if params.use_flow:
             scores['%s_%s-%s_nll_loss' % (data_set, lang1, lang2)] = avg_nll_loss.item()
 
@@ -692,9 +641,9 @@ def eval_moses_bleu(ref, hyp):
     assert os.path.isfile(hyp)
     assert os.path.isfile(ref) or os.path.isfile(ref + '0')
     assert os.path.isfile(BLEU_SCRIPT_PATH)
-    command = BLEU_SCRIPT_PATH + ' %s < %s'
-    p = subprocess.Popen(command % (ref, hyp), stdout=subprocess.PIPE, shell=True)
-    result = p.communicate()[0].decode("utf-8")
+    with open(hyp, 'rb') as f:
+        p = subprocess.run(['perl', BLEU_SCRIPT_PATH, ref], stdin=f, stdout=subprocess.PIPE)
+    result = p.stdout.decode("utf-8")
     if result.startswith('BLEU'):
         return float(result[7:result.index(',')])
     else:
